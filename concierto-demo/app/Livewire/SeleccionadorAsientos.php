@@ -9,53 +9,32 @@ use Carbon\Carbon;
 
 class SeleccionadorAsientos extends Component
 {
-    public $paso = 1; 
+    public $paso = 0; 
+    public $eventoSeleccionado = null;
     public $seccionActual = 'ORO';
     public $seleccionados = []; 
     public $boletosComprados = [];
-    public $historialCompras = [];
-    public $tiempoRestante = '';
-    
-    // Propiedades Admin
-    public $modoAdmin = false;
-    public $preciosEditables = [];
+    public $tiempoRestante = '05:00';
+    public $procesandoPago = false;
+    public $conSeguro = true; 
+    public $mostrarDetallesMovil = false;
 
-    public function mount()
-    {
-        $this->cargarPrecios();
-    }
+    public $tarjeta_nombre, $tarjeta_numero, $tarjeta_exp, $tarjeta_cvv;
 
-    public function cargarPrecios()
-    {
-        $this->preciosEditables = DB::table('prices')->pluck('monto', 'seccion')->toArray();
-    }
+    public $eventos = [
+        ['id' => 1, 'artista' => 'Carin León', 'fecha' => '15 Nov', 'imagen' => 'https://loremflickr.com/g/800/600/concert,mexico/all'],
+        ['id' => 2, 'artista' => 'Julión Álvarez', 'fecha' => '16 Nov', 'imagen' => 'https://loremflickr.com/g/800/600/singer,stage/all'],
+        ['id' => 3, 'artista' => 'Christian Nodal', 'fecha' => '17 Nov', 'imagen' => 'https://loremflickr.com/g/800/600/festival,crowd/all'],
+    ];
 
-    public function toggleAdmin()
-    {
-        $this->modoAdmin = !$this->modoAdmin;
-        if($this->modoAdmin) $this->cargarPrecios();
-    }
+    public function toggleDetalles() { $this->mostrarDetallesMovil = !$this->mostrarDetallesMovil; }
 
-    public function actualizarPrecioBD($seccion, $nuevoMonto)
-    {
-        DB::table('prices')->where('seccion', $seccion)->update(['monto' => $nuevoMonto]);
-        $this->cargarPrecios();
-        session()->flash('admin_msg', "Precio de $seccion actualizado.");
-    }
+    public function getPrecio($seccion) { return DB::table('prices')->where('seccion', $seccion)->value('monto') ?? 0; }
 
-    public function forzarEstadoAsiento($id, $estado)
+    public function seleccionarEvento($id)
     {
-        Seat::find($id)->update(['esta_ocupado' => $estado, 'on_hold_until' => null]);
-    }
-
-    public function limpiarExpirados()
-    {
-        Seat::where('on_hold_until', '<', now())->where('esta_ocupado', false)->update(['on_hold_until' => null]);
-    }
-
-    public function getPrecio($seccion)
-    {
-        return $this->preciosEditables[$seccion] ?? 0;
+        $this->eventoSeleccionado = collect($this->eventos)->firstWhere('id', $id);
+        $this->paso = 1;
     }
 
     public function seleccionarAsiento($id)
@@ -66,49 +45,47 @@ class SeleccionadorAsientos extends Component
         if (in_array($id, $this->seleccionados)) {
             $this->seleccionados = array_diff($this->seleccionados, [$id]);
         } else {
-            $this->seleccionados[] = $id;
+            if (count($this->seleccionados) < 6) {
+                $asiento->update(['on_hold_until' => now()->addMinutes(5)]);
+                $this->seleccionados[] = $id;
+            }
         }
     }
 
-    public function irAPagar()
-    {
-        if (empty($this->seleccionados)) return;
-        Seat::whereIn('id', $this->seleccionados)->update(['on_hold_until' => now()->addMinutes(5)]);
-        $this->paso = 2;
-    }
+    public function irAPagar() { if (!empty($this->seleccionados)) $this->paso = 2; }
 
     public function finalizarCompra()
     {
+        $this->procesandoPago = true;
+        sleep(2); 
         $this->boletosComprados = $this->seleccionados;
-        foreach($this->seleccionados as $id) {
-            $as = Seat::find($id);
-            if($as) $this->historialCompras[] = ['asiento' => $as->numero, 'seccion' => $as->seccion, 'fecha' => now()->format('H:i')];
-        }
         Seat::whereIn('id', $this->seleccionados)->update(['esta_ocupado' => true, 'on_hold_until' => null]);
+        $this->procesandoPago = false;
         $this->paso = 3;
     }
 
-    public function volverAlInicio()
-    {
-        $this->reset(['seleccionados', 'paso', 'boletosComprados', 'tiempoRestante']);
-    }
+    public function volverAlInicio() { $this->reset(['seleccionados', 'paso', 'boletosComprados', 'eventoSeleccionado', 'procesandoPago', 'conSeguro', 'mostrarDetallesMovil']); }
 
     public function render()
     {
-        $this->limpiarExpirados();
+        Seat::where('on_hold_until', '<', now())->where('esta_ocupado', false)->update(['on_hold_until' => null]);
 
-        if ($this->paso == 2 && !empty($this->seleccionados)) {
-            $primerAsiento = Seat::find($this->seleccionados[0]);
-            if ($primerAsiento && $primerAsiento->on_hold_until) {
-                $expiresAt = Carbon::parse($primerAsiento->on_hold_until);
-                $this->tiempoRestante = now()->greaterThan($expiresAt) ? '00:00' : now()->diff($expiresAt)->format('%I:%S');
+        if (!empty($this->seleccionados)) {
+            $ultimo = Seat::find(end($this->seleccionados));
+            if ($ultimo && $ultimo->on_hold_until) {
+                $diff = now()->diff(Carbon::parse($ultimo->on_hold_until));
+                $this->tiempoRestante = $diff->invert ? '00:00' : $diff->format('%I:%S');
+                if($diff->invert) $this->volverAlInicio(); 
             }
         }
 
+        $subtotal = collect($this->seleccionados)->sum(fn($id) => $this->getPrecio(Seat::find($id)->seccion));
+        $costoSeguro = $this->conSeguro ? (count($this->seleccionados) * 45) : 0;
+
         return view('livewire.seleccionador-asientos', [
-            'asientos' => Seat::where('seccion', $this->seccionActual)->get(),
-            'secciones' => array_keys($this->preciosEditables),
-            'total' => collect($this->seleccionados)->sum(fn($id) => $this->getPrecio(Seat::find($id)->seccion))
+            'filas' => Seat::where('seccion', $this->seccionActual)->get()->groupBy('fila'),
+            'secciones' => DB::table('prices')->pluck('seccion'),
+            'total' => $subtotal + $costoSeguro
         ]);
     }
 }
